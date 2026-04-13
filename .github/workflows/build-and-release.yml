@@ -1,0 +1,152 @@
+name: Build and Release strfry
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Optional upstream ref (tag/branch/sha)"
+        required: false
+        type: string
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  resolve-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.version.outputs.commit }}
+      upstream_describe: ${{ steps.version.outputs.upstream_describe }}
+      upstream_sha: ${{ steps.version.outputs.upstream_sha }}
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Resolve upstream version
+        id: version
+        run: |
+          git clone https://github.com/hoytech/strfry.git upstream
+          if [ -n "${{ github.event.inputs.upstream_ref }}" ]; then
+            git -C upstream fetch --tags origin "${{ github.event.inputs.upstream_ref }}"
+            git -C upstream checkout "${{ github.event.inputs.upstream_ref }}"
+          fi
+          COMMIT="$(git -C upstream rev-parse HEAD)"
+          UPSTREAM_DESCRIBE="$(git -C upstream describe --tags --always)"
+          UPSTREAM_SHA="$(git -C upstream rev-parse --short=12 HEAD)"
+          VERSION="${UPSTREAM_DESCRIBE}-${UPSTREAM_SHA}"
+          echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "upstream_describe=${UPSTREAM_DESCRIBE}" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve-upstream
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            artifact_suffix: amd64
+            cxx: g++
+            static: true
+          - arch: aarch64
+            artifact_suffix: arm64
+            cxx: aarch64-linux-gnu-g++
+            static: false
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            g++ make git perl pkg-config \
+            libssl-dev zlib1g-dev liblmdb-dev libflatbuffers-dev libsecp256k1-dev libzstd-dev
+
+      - name: Install aarch64 cross-toolchain dependencies
+        if: matrix.arch == 'aarch64'
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            libssl-dev:arm64 zlib1g-dev:arm64 liblmdb-dev:arm64 \
+            libflatbuffers-dev:arm64 libsecp256k1-dev:arm64 libzstd-dev:arm64
+
+      - name: Clone upstream strfry
+        run: |
+          git clone --recurse-submodules https://github.com/hoytech/strfry.git upstream
+          git -C upstream checkout "${{ needs.resolve-upstream.outputs.commit }}"
+          git -C upstream submodule update --init --recursive
+
+      - name: Build default binary
+        run: |
+          make -C upstream setup-golpe
+          make -C upstream -j"$(nproc)" OPT="-O3" CXX="${{ matrix.cxx }}"
+
+      - name: Build static binary target
+        if: matrix.static
+        run: |
+          make -C upstream -j"$(nproc)" BIN="strfry-static" OPT="-O3" CXX="g++" CXXFLAGS="-O3 -static -static-libstdc++ -static-libgcc" LDFLAGS="-static"
+
+      - name: Package build artifacts
+        id: package
+        run: |
+          mkdir -p dist
+          cp upstream/strfry dist/strfry
+
+          DYNAMIC_ARCHIVE="strfry-linux-${{ matrix.artifact_suffix }}-${{ needs.resolve-upstream.outputs.version }}.tar.gz"
+
+          tar -C dist -czf "$DYNAMIC_ARCHIVE" strfry
+          sha256sum "$DYNAMIC_ARCHIVE" > "${DYNAMIC_ARCHIVE}.sha256"
+
+          if [ "${{ matrix.static }}" = "true" ]; then
+            cp upstream/strfry-static dist/strfry-static
+            STATIC_ARCHIVE="strfry-linux-${{ matrix.artifact_suffix }}-static-${{ needs.resolve-upstream.outputs.version }}.tar.gz"
+            tar -C dist -czf "$STATIC_ARCHIVE" strfry-static
+            sha256sum "$STATIC_ARCHIVE" > "${STATIC_ARCHIVE}.sha256"
+          fi
+
+          echo "dynamic_archive=$DYNAMIC_ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: strfry-${{ matrix.arch }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+
+  release:
+    needs:
+      - resolve-upstream
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Create or update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: strfry-${{ needs.resolve-upstream.outputs.version }}
+          name: strfry ${{ needs.resolve-upstream.outputs.version }}
+          body: |
+            Linux builds of strfry.
+
+            - Architectures: `x86_64`, `aarch64`
+            - Variants: `x86_64` has `dynamic` and `static`; `aarch64` is `dynamic`
+            - Upstream describe: `${{ needs.resolve-upstream.outputs.upstream_describe }}`
+            - Upstream commit: `${{ needs.resolve-upstream.outputs.upstream_sha }}`
+          files: |
+            release/*
+          make_latest: true
+          generate_release_notes: true
