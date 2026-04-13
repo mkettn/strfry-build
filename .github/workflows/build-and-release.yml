@@ -2,11 +2,6 @@ name: Build and Release strfry
 
 on:
   workflow_dispatch:
-    inputs:
-      upstream_ref:
-        description: "Optional upstream ref (tag/branch/sha)"
-        required: false
-        type: string
   push:
     branches:
       - master
@@ -28,10 +23,15 @@ jobs:
         id: version
         run: |
           git clone https://github.com/hoytech/strfry.git upstream
-          if [ -n "${{ github.event.inputs.upstream_ref }}" ]; then
-            git -C upstream fetch --tags origin "${{ github.event.inputs.upstream_ref }}"
-            git -C upstream checkout "${{ github.event.inputs.upstream_ref }}"
+          git -C upstream fetch --tags origin
+
+          LATEST_TAG="$(git -C upstream for-each-ref --sort=-v:refname --count=1 --format='%(refname:strip=2)' refs/tags)"
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No upstream tags found" >&2
+            exit 1
           fi
+          git -C upstream checkout "$LATEST_TAG"
+
           COMMIT="$(git -C upstream rev-parse HEAD)"
           UPSTREAM_DESCRIBE="$(git -C upstream describe --tags --always)"
           UPSTREAM_SHA="$(git -C upstream rev-parse --short=12 HEAD)"
@@ -72,6 +72,20 @@ jobs:
         if: matrix.arch == 'aarch64'
         run: |
           sudo dpkg --add-architecture arm64
+
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i '/^URIs:/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
+          fi
+
+          sudo tee /etc/apt/sources.list.d/arm64-ports.sources >/dev/null <<'EOF'
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports
+          Suites: noble noble-updates noble-backports noble-security
+          Components: main universe restricted multiverse
+          Architectures: arm64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+
           sudo apt-get update
           sudo apt-get install -y \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
@@ -92,7 +106,7 @@ jobs:
       - name: Build static binary target
         if: matrix.static
         run: |
-          make -C upstream -j"$(nproc)" BIN="strfry-static" OPT="-O3" CXX="g++" CXXFLAGS="-O3 -static -static-libstdc++ -static-libgcc" LDFLAGS="-static"
+          make -C upstream -j"$(nproc)" BIN="strfry-static" OPT="-O3 -s"
 
       - name: Package build artifacts
         id: package
