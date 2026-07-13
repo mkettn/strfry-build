@@ -95,8 +95,14 @@ jobs:
       - name: Build binaries
         run: |
           make -C upstream setup-golpe
+
+          # golpe links '-lcrypto -lssl' which breaks fully static linking:
+          # libssl.a must come before libcrypto.a for the linker to resolve
+          # its symbols. Harmless for the dynamic build too.
+          sed -i 's/-lcrypto -lssl/-lssl -lcrypto/' upstream/golpe/rules.mk
+
           make -C upstream -j"$(nproc)" OPT="-O3"
-          make -C upstream -j"$(nproc)" BIN="strfry-static" OPT="-O3 -s"
+          make -C upstream -j"$(nproc)" BIN="strfry-static" OPT="-O3 -s" XLDFLAGS="-static"
 
       - name: Smoke-test binaries
         run: |
