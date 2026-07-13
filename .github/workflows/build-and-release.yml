@@ -2,6 +2,11 @@ name: Build and Release strfry
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream strfry tag to build (e.g. 1.1.0). Leave empty for the latest stable tag."
+        required: false
+        default: ""
   push:
     branches:
       - master
@@ -14,54 +19,66 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       commit: ${{ steps.version.outputs.commit }}
-      upstream_describe: ${{ steps.version.outputs.upstream_describe }}
-      upstream_sha: ${{ steps.version.outputs.upstream_sha }}
       version: ${{ steps.version.outputs.version }}
+      skip: ${{ steps.guard.outputs.skip }}
 
     steps:
       - name: Resolve upstream version
         id: version
         run: |
-          git clone https://github.com/hoytech/strfry.git upstream
-          git -C upstream fetch --tags origin
+          REQUESTED_TAG="${{ github.event.inputs.tag }}"
 
-          LATEST_TAG="$(git -C upstream tag --sort=-v:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)"
+          if [ -n "$REQUESTED_TAG" ]; then
+            TAG="$REQUESTED_TAG"
+          else
+            TAG="$(git ls-remote --tags --refs https://github.com/hoytech/strfry.git \
+              | awk -F/ '{print $NF}' \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V | tail -n1)"
+          fi
 
-          if [ -z "$LATEST_TAG" ]; then
-            echo "No stable upstream tags found" >&2
+          if [ -z "$TAG" ]; then
+            echo "Could not resolve an upstream tag" >&2
             exit 1
           fi
-          git -C upstream checkout "$LATEST_TAG"
 
-          COMMIT="$(git -C upstream rev-parse HEAD)"
-          UPSTREAM_DESCRIBE="$(git -C upstream describe --tags --always)"
-          UPSTREAM_SHA="$(git -C upstream rev-parse --short=12 HEAD)"
-          VERSION="${UPSTREAM_DESCRIBE}-${UPSTREAM_SHA}"
+          COMMIT="$(git ls-remote https://github.com/hoytech/strfry.git "refs/tags/${TAG}^{}" "refs/tags/${TAG}" | head -n1 | cut -f1)"
+
+          if [ -z "$COMMIT" ]; then
+            echo "Upstream tag '$TAG' not found" >&2
+            exit 1
+          fi
+
+          echo "Resolved upstream tag $TAG at commit $COMMIT"
+          echo "version=${TAG}" >> "$GITHUB_OUTPUT"
           echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
-          echo "upstream_describe=${UPSTREAM_DESCRIBE}" >> "$GITHUB_OUTPUT"
-          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if release already exists
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.version.outputs.version }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release ${{ steps.version.outputs.version }} already exists, skipping build"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
 
   build:
     needs: resolve-upstream
+    if: needs.resolve-upstream.outputs.skip != 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: x86_64
-            artifact_suffix: amd64
-            cxx: g++
-            static: true
-          - arch: aarch64
-            artifact_suffix: arm64
-            cxx: aarch64-linux-gnu-g++
-            static: false
-    runs-on: ubuntu-latest
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
 
     steps:
-      - name: Checkout this repository
-        uses: actions/checkout@v4
-
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -69,65 +86,55 @@ jobs:
             g++ make git perl pkg-config \
             libssl-dev zlib1g-dev liblmdb-dev libflatbuffers-dev libsecp256k1-dev libzstd-dev
 
-      - name: Install aarch64 cross-toolchain dependencies
-        if: matrix.arch == 'aarch64'
-        run: |
-          sudo dpkg --add-architecture arm64
-
-          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-            sudo sed -i '/^URIs:/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
-          fi
-
-          sudo tee /etc/apt/sources.list.d/arm64-ports.sources >/dev/null <<'EOF'
-          Types: deb
-          URIs: http://ports.ubuntu.com/ubuntu-ports
-          Suites: noble noble-updates noble-backports noble-security
-          Components: main universe restricted multiverse
-          Architectures: arm64
-          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-          EOF
-
-          sudo apt-get update
-          sudo apt-get install -y \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            libssl-dev:arm64 zlib1g-dev:arm64 liblmdb-dev:arm64 \
-            libflatbuffers-dev:arm64 libsecp256k1-dev:arm64 libzstd-dev:arm64
-
       - name: Clone upstream strfry
         run: |
-          git clone --recurse-submodules https://github.com/hoytech/strfry.git upstream
+          git clone https://github.com/hoytech/strfry.git upstream
           git -C upstream checkout "${{ needs.resolve-upstream.outputs.commit }}"
           git -C upstream submodule update --init --recursive
 
-      - name: Build default binary
+      - name: Build binaries
         run: |
           make -C upstream setup-golpe
-          make -C upstream -j"$(nproc)" OPT="-O3" CXX="${{ matrix.cxx }}"
-
-      - name: Build static binary target
-        if: matrix.static
-        run: |
+          make -C upstream -j"$(nproc)" OPT="-O3"
           make -C upstream -j"$(nproc)" BIN="strfry-static" OPT="-O3 -s"
 
-      - name: Package build artifacts
-        id: package
+      - name: Smoke-test binaries
         run: |
-          mkdir -p dist
-          cp upstream/strfry dist/strfry
-
-          DYNAMIC_ARCHIVE="strfry-linux-${{ matrix.artifact_suffix }}-${{ needs.resolve-upstream.outputs.version }}.tar.gz"
-
-          tar -C dist -czf "$DYNAMIC_ARCHIVE" strfry
-          sha256sum "$DYNAMIC_ARCHIVE" > "${DYNAMIC_ARCHIVE}.sha256"
-
-          if [ "${{ matrix.static }}" = "true" ]; then
-            cp upstream/strfry-static dist/strfry-static
-            STATIC_ARCHIVE="strfry-linux-${{ matrix.artifact_suffix }}-static-${{ needs.resolve-upstream.outputs.version }}.tar.gz"
-            tar -C dist -czf "$STATIC_ARCHIVE" strfry-static
-            sha256sum "$STATIC_ARCHIVE" > "${STATIC_ARCHIVE}.sha256"
+          # docopt may exit non-zero on --version; anything below 126 proves the
+          # binary loads and executes (126+/signals indicate a broken binary)
+          for bin in upstream/strfry upstream/strfry-static; do
+            rc=0
+            "$bin" --version || rc=$?
+            if [ "$rc" -ge 126 ]; then
+              echo "$bin failed to execute (exit $rc)" >&2
+              exit "$rc"
+            fi
+            file "$bin"
+          done
+          if ldd upstream/strfry-static 2>&1 | grep -qi 'not a dynamic executable\|statically linked'; then
+            echo "strfry-static is statically linked"
+          else
+            echo "strfry-static is NOT statically linked:" >&2
+            ldd upstream/strfry-static >&2
+            exit 1
           fi
 
-          echo "dynamic_archive=$DYNAMIC_ARCHIVE" >> "$GITHUB_OUTPUT"
+      - name: Package build artifacts
+        run: |
+          VERSION="${{ needs.resolve-upstream.outputs.version }}"
+
+          mkdir -p dist-dynamic dist-static
+          cp upstream/strfry dist-dynamic/strfry
+          cp upstream/strfry-static dist-static/strfry
+
+          DYNAMIC_ARCHIVE="strfry-linux-${{ matrix.arch }}-${VERSION}.tar.gz"
+          STATIC_ARCHIVE="strfry-linux-${{ matrix.arch }}-static-${VERSION}.tar.gz"
+
+          tar -C dist-dynamic -czf "$DYNAMIC_ARCHIVE" strfry
+          tar -C dist-static -czf "$STATIC_ARCHIVE" strfry
+
+          sha256sum "$DYNAMIC_ARCHIVE" > "${DYNAMIC_ARCHIVE}.sha256"
+          sha256sum "$STATIC_ARCHIVE" > "${STATIC_ARCHIVE}.sha256"
 
       - name: Upload packaged artifacts
         uses: actions/upload-artifact@v4
@@ -141,6 +148,7 @@ jobs:
     needs:
       - resolve-upstream
       - build
+    if: needs.resolve-upstream.outputs.skip != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Download packaged artifacts
@@ -149,19 +157,23 @@ jobs:
           path: release
           merge-multiple: true
 
-      - name: Create or update GitHub release
+      - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: strfry-${{ needs.resolve-upstream.outputs.version }}
+          tag_name: ${{ needs.resolve-upstream.outputs.version }}
           name: strfry ${{ needs.resolve-upstream.outputs.version }}
           body: |
-            Linux builds of strfry.
+            Linux builds of [strfry](https://github.com/hoytech/strfry) `${{ needs.resolve-upstream.outputs.version }}` (upstream commit `${{ needs.resolve-upstream.outputs.commit }}`).
 
-            - Architectures: `x86_64`, `aarch64`
-            - Variants: `x86_64` has `dynamic` and `static`; `aarch64` is `dynamic`
-            - Upstream describe: `${{ needs.resolve-upstream.outputs.upstream_describe }}`
-            - Upstream commit: `${{ needs.resolve-upstream.outputs.upstream_sha }}`
+            | Asset | Architecture | Linkage |
+            | --- | --- | --- |
+            | `strfry-linux-amd64-static-*.tar.gz` | x86_64 | static — runs on any Linux distro |
+            | `strfry-linux-arm64-static-*.tar.gz` | aarch64 | static — runs on any Linux distro |
+            | `strfry-linux-amd64-*.tar.gz` | x86_64 | dynamic — built on Ubuntu 24.04 |
+            | `strfry-linux-arm64-*.tar.gz` | aarch64 | dynamic — built on Ubuntu 24.04 |
+
+            Each archive contains a single `strfry` binary. Verify downloads with the matching `.sha256` file:
+            `sha256sum -c strfry-linux-<arch>[-static]-${{ needs.resolve-upstream.outputs.version }}.tar.gz.sha256`
           files: |
             release/*
           make_latest: true
-          generate_release_notes: true
